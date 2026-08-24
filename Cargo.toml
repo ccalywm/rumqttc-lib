@@ -12,6 +12,7 @@ name = "rumqttc"
 # - 禁用默认特性（default → use-rustls → tokio-rustls/default → aws-lc-rs，Windows 交叉编译需要 dlltool.exe）
 # - use-rustls-no-provider 只引入 rustls 类型，不绑定加密后端
 # - 手动添加 rustls + ring 作为加密后端（兼容 Windows 交叉编译）
+#rumqttc = "0.25.1"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 # 异步运行时
@@ -19,7 +20,7 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "sync", "macros", "ti
 # 传统 JNI 支持库
 # 注意：0.22 的 jni-macros 依赖链会引入 windows-sys，Windows 交叉编译需要 dlltool.exe
 # 暂时保持 0.21，等 jni 0.23+ 解决此问题再升级
-jni = "0.21"
+jni = "0.22"
 # 日志
 log = "0.4"
 android_logger = "0.15"

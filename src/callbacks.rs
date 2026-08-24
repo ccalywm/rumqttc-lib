@@ -4,9 +4,9 @@
 //! 当 MQTT 事件发生时（连接成功、收到消息、连接断开、发生错误），
 //! 通过 JNI 调用 Kotlin 端实现的接口方法，把事件传递回去。
 
-use jni::objects::{GlobalRef, JObject};
-use jni::JNIEnv;
-use jni::sys::{jboolean, jint};
+use jni::objects::{Global, JObject};
+use jni::Env;
+use jni::sys::jboolean;
 use log::error;
 use std::sync::Arc;
 
@@ -65,7 +65,7 @@ pub struct CallbackManager {
 
     /// Kotlin callback 对象的全局引用
     /// 使用 Option 包装是为了在 release 时可以 take 出来并释放
-    global_ref: Option<GlobalRef>,
+    global_ref: Option<Global<JObject<'static>>>,
 }
 
 impl CallbackManager {
@@ -82,7 +82,7 @@ impl CallbackManager {
     /// ## 内部做了什么？
     /// 1. 从 JNIEnv 中获取 JavaVM 引用（JavaVM 是全局的，可以在任何线程使用）
     /// 2. 把 callback_obj 从局部引用转换成全局引用（防止被 GC 回收）
-    pub fn new(env: &mut JNIEnv, callback_obj: JObject) -> jni::errors::Result<Self> {
+    pub fn new(env: &mut Env, callback_obj: JObject) -> jni::errors::Result<Self> {
         let java_vm = env.get_java_vm()?;
         let global_ref = env.new_global_ref(callback_obj)?;
         Ok(Self {
@@ -114,19 +114,16 @@ impl CallbackManager {
     /// ## 返回值
     /// - `Some(env)`：附加成功，可以用这个 env 调用 Java 方法
     /// - `None`：附加失败（极少发生）
-    fn attach(&self) -> Option<jni::JNIEnv<'_>> {
-        match self.java_vm.attach_current_thread_as_daemon() {
-            Ok(env) => Some(env),
-            Err(e) => {
-                error!("[Callback] 无法附加线程到 JVM: {}", e);
-                None
-            }
+    fn attach<F>(&self, f: F)
+    where
+        F: FnOnce(&mut Env, &Global<JObject<'static>>) -> jni::errors::Result<()>,
+    {
+        let Some(global_ref) = self.global_ref.as_ref() else { return };
+        let result: Result<(), jni::errors::Error> =
+            self.java_vm.attach_current_thread(|env| f(env, global_ref));
+        if let Err(e) = result {
+            error!("[Callback] 无法附加线程到 JVM: {}", e);
         }
-    }
-
-    /// 获取全局引用
-    fn global_ref(&self) -> Option<&GlobalRef> {
-        self.global_ref.as_ref()
     }
 
     // ═══════════════════════════════════════════════════════
@@ -150,32 +147,17 @@ impl CallbackManager {
     /// - Ljava/lang/String;：第二个参数是 String
     /// - V：返回值是 void（没有返回值）
     pub fn connect_complete(&self, reconnect: bool, server_uri: &str) {
-        // 第 1 步：把当前线程附加到 JVM
-        let Some(mut env) = self.attach() else { return };
-        // 第 2 步：获取 Kotlin callback 对象
-        let Some(cb) = self.global_ref() else { return };
-
-        // 第 3 步：把 Rust 的 String 转换成 Java 的 String 对象
-        let uri_jstr = match env.new_string(server_uri) {
-            Ok(s) => s,
-            Err(e) => { error!("[Callback] new_string 失败: {}", e); return; }
-        };
-
-        // 第 4 步：把 Rust 的 bool 转换成 JNI 的 jboolean（0 或 1）
-        let reconnect_val: jboolean = if reconnect { 1 } else { 0 };
-
-        // 第 5 步：调用 Kotlin 的 connectComplete 方法
-        if let Err(e) = env.call_method(
-            cb,
-            "connectComplete",
-            "(ZLjava/lang/String;)V",
-            &[reconnect_val.into(), (&uri_jstr).into()],
-        ) {
-            // 如果 Kotlin 端抛出了异常（比如方法不存在），
-            // 这里会捕获到错误，打印日志，然后清除异常状态
-            error!("[Callback] connectComplete 调用失败: {}", e);
-            let _ = env.exception_clear();
-        }
+        self.attach(|env, cb| {
+            let uri_jstr = env.new_string(server_uri)?;
+            let reconnect_val: jboolean = reconnect;
+            env.call_method(
+                cb,
+                jni::jni_str!("connectComplete"),
+                jni::jni_sig!((boolean, java.lang.String) -> void),
+                &[jni::JValue::Bool(reconnect_val), jni::JValue::Object(&uri_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     /// 通知 Kotlin：连接断开了
@@ -192,26 +174,16 @@ impl CallbackManager {
     /// 连接断开后，Rust 会自动等待 reconnect_interval_secs 秒后重新连接，
     /// 不需要 Kotlin 端做任何操作。
     pub fn connection_lost(&self, cause: &str) {
-        let Some(mut env) = self.attach() else { return };
-        let Some(cb) = self.global_ref() else { return };
-
-        let cause_jstr = match env.new_string(cause) {
-            Ok(s) => s,
-            Err(e) => { error!("[Callback] new_string 失败: {}", e); return; }
-        };
-
-        // JNI 方法签名：(Ljava/lang/String;)V
-        // - Ljava/lang/String;：参数是 String
-        // - V：返回值是 void
-        if let Err(e) = env.call_method(
-            cb,
-            "connectionLost",
-            "(Ljava/lang/String;)V",
-            &[(&cause_jstr).into()],
-        ) {
-            error!("[Callback] connectionLost 调用失败: {}", e);
-            let _ = env.exception_clear();
-        }
+        self.attach(|env, cb| {
+            let cause_jstr = env.new_string(cause)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("connectionLost"),
+                jni::jni_sig!((java.lang.String) -> void),
+                &[jni::JValue::Object(&cause_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     /// 通知 Kotlin：收到了 MQTT 消息
@@ -226,41 +198,17 @@ impl CallbackManager {
     /// 这个方法会在收到 MQTT PUBLISH 消息时立即调用，
     /// 回调发生在 Tokio 后台线程中，不要在里面做耗时操作。
     pub fn on_msg(&self, topic: &str, message: &str) {
-        let Some(mut env) = self.attach() else {
-            error!("[Callback] on_msg: attach 失败，无法回调");
-            return;
-        };
-        let Some(cb) = self.global_ref() else {
-            error!("[Callback] on_msg: global_ref 为空，无法回调");
-            return;
-        };
-
-        // 把 Rust 的 &str 转换成 Java 的 String 对象
-        let topic_jstr = match env.new_string(topic) {
-            Ok(s) => s,
-            Err(e) => { error!("[Callback] new_string(topic) 失败: {}", e); return; }
-        };
-        let msg_jstr = match env.new_string(message) {
-            Ok(s) => s,
-            Err(e) => { error!("[Callback] new_string(msg) 失败: {}", e); return; }
-        };
-
-        // JNI 方法签名：(Ljava/lang/String;Ljava/lang/String;)V
-        // - 两个 String 参数，返回值 void
-        if let Err(e) = env.call_method(
-            cb,
-            "onMsg",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            &[(&topic_jstr).into(), (&msg_jstr).into()],
-        ) {
-            error!("[Callback] onMsg 调用失败: {}", e);
-            // ⚠️ 关键：必须清除异常！
-            // 如果 Kotlin 端的 onMsg 方法抛出了异常（比如 NullPointerException），
-            // JVM 会在当前线程留下一个"待处理异常"（pending exception）。
-            // 如果不清除，后续的 JNI 调用会触发 ART 的 abort（闪退）。
-            // 这是我们之前遇到的闪退 bug 的根本原因。
-            let _ = env.exception_clear();
-        }
+        self.attach(|env, cb| {
+            let topic_jstr = env.new_string(topic)?;
+            let msg_jstr = env.new_string(message)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("onMsg"),
+                jni::jni_sig!((java.lang.String, java.lang.String) -> void),
+                &[jni::JValue::Object(&topic_jstr), jni::JValue::Object(&msg_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     /// 通知 Kotlin：发生了错误
@@ -274,27 +222,16 @@ impl CallbackManager {
     ///   - 3 (ERR_PUBLISH_FAILED)：发布失败
     /// - `message`：错误的详细描述文本
     pub fn on_error(&self, code: i32, message: &str) {
-        let Some(mut env) = self.attach() else { return };
-        let Some(cb) = self.global_ref() else { return };
-
-        let msg_jstr = match env.new_string(message) {
-            Ok(s) => s,
-            Err(e) => { error!("[Callback] new_string 失败: {}", e); return; }
-        };
-
-        // JNI 方法签名：(ILjava/lang/String;)V
-        // - I：第一个参数是 int（错误码）
-        // - Ljava/lang/String;：第二个参数是 String（错误描述）
-        // - V：返回值是 void
-        if let Err(e) = env.call_method(
-            cb,
-            "onError",
-            "(ILjava/lang/String;)V",
-            &[(code as jint).into(), (&msg_jstr).into()],
-        ) {
-            error!("[Callback] onError 调用失败: {}", e);
-            let _ = env.exception_clear();
-        }
+        self.attach(|env, cb| {
+            let msg_jstr = env.new_string(message)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("onError"),
+                jni::jni_sig!((int, java.lang.String) -> void),
+                &[jni::JValue::Int(code), jni::JValue::Object(&msg_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     /// 释放 JNI 全局引用

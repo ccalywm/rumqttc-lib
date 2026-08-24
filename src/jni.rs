@@ -50,8 +50,8 @@
 //! ```
 
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jint, jlong};
-use jni::JNIEnv;
+use jni::sys::{jboolean, jlong};
+use jni::EnvUnowned;
 use std::sync::Arc;
 
 use crate::callbacks::{CallbackManager, ERR_INVALID_PARAMS};
@@ -121,7 +121,7 @@ unsafe fn try_get_core<'a>(core_ptr: jlong) -> Option<&'a mut NativeMqttCore> {
 /// - `jstr` 可能指向已被垃圾回收的对象
 /// - JVM 内存不足，无法分配新的字符串
 /// - 字符串包含非法 UTF-8 序列（极少见）
-fn safe_get_string(env: &mut JNIEnv, jstr: &JString) -> String {
+fn safe_get_string(env: &mut jni::Env, jstr: &JString) -> String {
     // 检查是否为空引用
     if jstr.is_null() {
         return String::new();
@@ -131,9 +131,9 @@ fn safe_get_string(env: &mut JNIEnv, jstr: &JString) -> String {
     // 这个方法会：
     // 1. 从 JVM 获取字符串数据
     // 2. 转换为 Rust 的 Modified UTF-8 格式
-    // 3. 返回 JavaStr（智能指针，自动释放）
-    match env.get_string(jstr) {
-        Ok(s) => s.into(), // JavaStr → String（自动复制数据）
+    // 3. 返回 MUTF8Chars（智能指针，自动释放）
+    match jstr.mutf8_chars(env) {
+        Ok(s) => s.to_string(),
         Err(e) => {
             log::error!("[JNI] get_string 失败: {}", e);
             String::new()
@@ -153,7 +153,7 @@ fn safe_get_string(env: &mut JNIEnv, jstr: &JString) -> String {
 /// ## 返回值
 ///
 /// 转换后的 Rust `Vec<u8>`。如果转换失败或数组为空，返回空向量。
-fn safe_get_byte_array(env: &mut JNIEnv, arr: &JByteArray) -> Vec<u8> {
+fn safe_get_byte_array(env: &mut jni::Env, arr: &JByteArray) -> Vec<u8> {
     if arr.is_null() {
         return Vec::new();
     }
@@ -179,7 +179,7 @@ fn safe_get_byte_array(env: &mut JNIEnv, arr: &JByteArray) -> Vec<u8> {
 /// ## 返回值
 ///
 /// 转换后的 Rust `Vec<String>`。空元素会被过滤掉。
-fn safe_get_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
+fn safe_get_string_array(env: &mut jni::Env, arr: &JObjectArray<JString>) -> Vec<String> {
     if arr.is_null() {
         return Vec::new();
     }
@@ -187,14 +187,13 @@ fn safe_get_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
     let mut result = Vec::new();
 
     // 获取数组长度
-    if let Ok(len) = env.get_array_length(arr) {
+    if let Ok(len) = arr.len(env) {
         // 逐个提取元素
         for i in 0..len {
             // 获取数组中第 i 个元素
-            if let Ok(elem) = env.get_object_array_element(arr, i) {
-                // 把 JObject 转换为 JString
-                let jstr: JString = elem.into();
-                let s = safe_get_string(env, &jstr);
+            if let Ok(elem) = arr.get_element(env, i as usize) {
+                // 把 JString 转换为 String
+                let s = safe_get_string(env, &elem);
                 // 过滤掉空字符串
                 if !s.is_empty() {
                     result.push(s);
@@ -233,18 +232,15 @@ fn safe_get_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
 /// Kotlin 端应该检查返回值是否为 0，如果为 0 则不继续调用其他方法。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeCreate(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     debug: jboolean,
 ) -> jlong {
     // 初始化日志系统
-    //
-    // `init_once` 保证只初始化一次，即使多次调用也不会报错。
-    // 这对于库代码很重要，因为用户可能创建多个 RumqttcClient 实例。
-    let level = if debug != 0 {
-        log::LevelFilter::Info  // 输出 Info、Warn、Error
+    let level = if debug {
+        log::LevelFilter::Info
     } else {
-        log::LevelFilter::Off   // 关闭所有日志
+        log::LevelFilter::Off
     };
 
     android_logger::init_once(
@@ -252,7 +248,7 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeCreate(
             .with_max_level(level),
     );
 
-    log::info!("[JNI] nativeCreate (debug={})", debug != 0);
+    log::info!("[JNI] nativeCreate (debug={})", debug);
 
     // 创建 NativeMqttCore 实例
     match NativeMqttCore::new() {
@@ -311,142 +307,120 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeCreate(
 /// 如果 Kotlin 端传入的是 `"tcp://192.168.1.100"`，这里会自动剥离为 `"192.168.1.100"`。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeConnect(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _class: JClass,
     core_ptr: jlong,
     host: JString,
-    port: jint,
+    port: jni::sys::jint,
     client_id: JString,
     username: JString,
     password: JString,
-    qos: jint,
-    keep_alive_secs: jint,
-    reconnect_interval_secs: jint,
-    message_buffer_size: jint,
+    qos: jni::sys::jint,
+    keep_alive_secs: jni::sys::jint,
+    reconnect_interval_secs: jni::sys::jint,
+    message_buffer_size: jni::sys::jint,
     clean_session: jboolean,
-    connection_timeout_secs: jint,
-    topics_array: JObjectArray,
+    connection_timeout_secs: jni::sys::jint,
+    topics_array: JObjectArray<JString>,
     callback_obj: JObject,
 ) {
-    // 第一步：验证指针
-    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return };
+    env.with_env(|env| {
+        // 第一步：验证指针
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return Ok::<(), jni::errors::Error>(()) };
 
-    // 第二步：验证回调对象
-    // 必须在解析其他参数之前验证，因为后续的错误通知都依赖回调
-    if callback_obj.is_null() {
-        log::error!("[JNI] callback_obj 为空，无法连接");
-        return;
-    }
-
-    // 第三步：创建回调管理器
-    //
-    // CallbackManager 会：
-    // 1. 把 Kotlin 回调对象转换为 GlobalRef（防止被垃圾回收）
-    // 2. 查找回调方法的签名（connectComplete、onMsg 等）
-    // 3. 缓存 JavaVM 引用（用于跨线程调用）
-    let callbacks = match CallbackManager::new(&mut env, callback_obj) {
-        Ok(cb) => Arc::new(cb),
-        Err(e) => {
-            log::error!("[JNI] 创建 CallbackManager 失败: {}", e);
-            // 此时没有可用的回调通道，只能记录日志
-            return;
+        // 第二步：验证回调对象
+        if callback_obj.is_null() {
+            log::error!("[JNI] callback_obj 为空，无法连接");
+            return Ok(());
         }
-    };
 
-    // 第四步：解析配置参数
+        // 第三步：创建回调管理器
+        let callbacks = match CallbackManager::new(env, callback_obj) {
+            Ok(cb) => Arc::new(cb),
+            Err(e) => {
+                log::error!("[JNI] 创建 CallbackManager 失败: {}", e);
+                return Ok(());
+            }
+        };
 
-    // 先创建一个默认配置，然后逐个字段覆盖
-    let mut config = MqttConfig::default();
+        // 第四步：解析配置参数
+        let mut config = MqttConfig::default();
 
-    // 解析 host，自动剥离 tcp:// 前缀
-    let host_str = safe_get_string(&mut env, &host);
-    config.host = if host_str.starts_with("tcp://") {
-        host_str[6..].to_string() // 去掉前 6 个字符 "tcp://"
-    }else if host_str.starts_with("ssl://"){
-        host_str[6..].to_string() // 去掉前 6 个字符 "ssl://"
-    } else {
-        host_str
-    };
+        let host_str = safe_get_string(env, &host);
+        config.host = if host_str.starts_with("tcp://") {
+            host_str[6..].to_string()
+        } else if host_str.starts_with("ssl://") {
+            host_str[6..].to_string()
+        } else {
+            host_str
+        };
 
-    config.port = port as u16;
-    config.client_id = safe_get_string(&mut env, &client_id);
-    config.username = safe_get_string(&mut env, &username);
-    config.password = safe_get_string(&mut env, &password);
+        config.port = port as u16;
+        config.client_id = safe_get_string(env, &client_id);
+        config.username = safe_get_string(env, &username);
+        config.password = safe_get_string(env, &password);
 
-    // 把整数 QoS 转换为 rumqttc 的枚举
-    config.qos = match qos {
-        0 => rumqttc::QoS::AtMostOnce,    // 最多一次
-        1 => rumqttc::QoS::AtLeastOnce,   // 至少一次
-        2 => rumqttc::QoS::ExactlyOnce,   // 恰好一次
-        _ => rumqttc::QoS::AtMostOnce,    // 其他值默认为 0
-    };
+        config.qos = match qos {
+            0 => rumqttc::QoS::AtMostOnce,
+            1 => rumqttc::QoS::AtLeastOnce,
+            2 => rumqttc::QoS::ExactlyOnce,
+            _ => rumqttc::QoS::AtMostOnce,
+        };
 
-    // 心跳间隔：如果传入的值 ≤0，使用默认值 10 秒
-    config.keep_alive_secs = if keep_alive_secs > 0 {
-        keep_alive_secs as u64
-    } else {
-        10
-    };
+        config.keep_alive_secs = if keep_alive_secs > 0 {
+            keep_alive_secs as u64
+        } else {
+            10
+        };
 
-    // 重连间隔：如果传入的值 ≤0，使用默认值 10 秒
-    config.reconnect_interval_secs = if reconnect_interval_secs > 0 {
-        reconnect_interval_secs as u64
-    } else {
-        10
-    };
+        config.reconnect_interval_secs = if reconnect_interval_secs > 0 {
+            reconnect_interval_secs as u64
+        } else {
+            10
+        };
 
-    // 消息队列容量：如果传入的值 ≤0，使用默认值 10000
-    config.message_buffer_size = if message_buffer_size > 0 {
-        message_buffer_size as usize
-    } else {
-        10000
-    };
+        config.message_buffer_size = if message_buffer_size > 0 {
+            message_buffer_size as usize
+        } else {
+            10000
+        };
 
-    // 清除会话标志：
-    // - true（默认）：每次连接都从干净的状态开始，不保留之前的订阅和消息
-    // - false：保留之前的会话状态（需要服务器支持持久会话）
-    config.clean_session = clean_session != 0;
+        config.clean_session = clean_session;
 
-    // 连接超时：如果传入的值 ≤0，使用默认值 5 秒
-    config.connection_timeout_secs = if connection_timeout_secs > 0 {
-        connection_timeout_secs as u64
-    } else {
-        5
-    };
+        config.connection_timeout_secs = if connection_timeout_secs > 0 {
+            connection_timeout_secs as u64
+        } else {
+            5
+        };
 
-    // 解析主题数组
-    config.topics = safe_get_string_array(&mut env, &topics_array);
+        config.topics = safe_get_string_array(env, &topics_array);
 
-    // 第五步：参数校验
-    // host 和 clientId 是必填项，如果为空则通过回调通知错误
-    if config.host.is_empty() || config.client_id.is_empty() {
-        let msg = format!(
-            "host 或 clientId 为空，无法连接 (host='{}', clientId='{}')",
-            config.host, config.client_id
+        if config.host.is_empty() || config.client_id.is_empty() {
+            let msg = format!(
+                "host 或 clientId 为空，无法连接 (host='{}', clientId='{}')",
+                config.host, config.client_id
+            );
+            log::error!("[JNI] {}", msg);
+            callbacks.on_error(ERR_INVALID_PARAMS, &msg);
+            return Ok(());
+        }
+
+        log::info!(
+            "[JNI] 连接配置: host={}, port={}, clientId={}, qos={}, keepAlive={}s, reconnectInterval={}s, messageBuffer={}, cleanSession={}, connectionTimeout={}s, topics={:?}",
+            config.host, config.port, config.client_id, qos,
+            config.keep_alive_secs, config.reconnect_interval_secs,
+            config.message_buffer_size,
+            config.clean_session,
+            config.connection_timeout_secs,
+            config.topics
         );
-        log::error!("[JNI] {}", msg);
-        callbacks.on_error(ERR_INVALID_PARAMS, &msg);
-        return;
-    }
 
-    log::info!(
-        "[JNI] 连接配置: host={}, port={}, clientId={}, qos={}, keepAlive={}s, reconnectInterval={}s, messageBuffer={}, cleanSession={}, connectionTimeout={}s, topics={:?}",
-        config.host, config.port, config.client_id, qos,
-        config.keep_alive_secs, config.reconnect_interval_secs,
-        config.message_buffer_size,
-        config.clean_session,
-        config.connection_timeout_secs,
-        config.topics
-    );
+        core.set_callbacks(callbacks);
+        core.connect(config);
 
-    // 第六步：存入回调管理器并启动连接
-    //
-    // `set_callbacks()` 必须在 `connect()` 之前调用，
-    // 因为 connect 启动的后台任务需要回调来通知上层
-    core.set_callbacks(callbacks);
-    core.connect(config);
-
-    log::info!("[JNI] 连接请求已提交，等待回调...");
+        log::info!("[JNI] 连接请求已提交，等待回调...");
+        Ok(())
+    }).resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Kotlin 调用：`nativePublish(ptr, topic, payload, qos)`
@@ -466,37 +440,36 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeConnect(
 /// - 未连接或发布失败 → `callback.onError(ERR_PUBLISH_FAILED, message)`
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativePublish(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _class: JClass,
     core_ptr: jlong,
     topic: JString,
     payload: JByteArray,
-    qos: jint,
+    qos: jni::sys::jint,
 ) {
-    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return };
+    env.with_env(|env| {
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return Ok::<(), jni::errors::Error>(()) };
 
-    // 解析参数
-    let topic_str = safe_get_string(&mut env, &topic);
-    let payload_vec = safe_get_byte_array(&mut env, &payload);
+        let topic_str = safe_get_string(env, &topic);
+        let payload_vec = safe_get_byte_array(env, &payload);
 
-    // 验证 topic 不为空
-    if topic_str.is_empty() {
-        log::error!("[JNI] topic 为空，发布已忽略");
-        return;
-    }
+        if topic_str.is_empty() {
+            log::error!("[JNI] topic 为空，发布已忽略");
+            return Ok(());
+        }
 
-    // 转换 QoS
-    let qos_val = match qos {
-        0 => rumqttc::QoS::AtMostOnce,
-        1 => rumqttc::QoS::AtLeastOnce,
-        2 => rumqttc::QoS::ExactlyOnce,
-        _ => rumqttc::QoS::AtMostOnce,
-    };
+        let qos_val = match qos {
+            0 => rumqttc::QoS::AtMostOnce,
+            1 => rumqttc::QoS::AtLeastOnce,
+            2 => rumqttc::QoS::ExactlyOnce,
+            _ => rumqttc::QoS::AtMostOnce,
+        };
 
-    log::info!("[JNI] 发布: topic={}, size={}, qos={}", topic_str, payload_vec.len(), qos);
+        log::info!("[JNI] 发布: topic={}, size={}, qos={}", topic_str, payload_vec.len(), qos);
 
-    // 调用 core.publish()，内部会异步执行
-    core.publish(topic_str, payload_vec, qos_val);
+        core.publish(topic_str, payload_vec, qos_val);
+        Ok(())
+    }).resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Kotlin 调用：`nativeIsConnected(ptr): Boolean`
@@ -518,12 +491,12 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativePublish(
 /// 可以在主线程安全调用，不会阻塞 UI。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeIsConnected(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     core_ptr: jlong,
 ) -> jboolean {
-    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return 0 };
-    if core.is_connected() { 1 } else { 0 }
+    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return false };
+    core.is_connected()
 }
 
 /// Kotlin 调用：`nativeDestroy(ptr)`
@@ -548,29 +521,21 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeIsConnected(
 /// Kotlin 端应该在 Activity/Service 的 `onDestroy()` 中调用此方法。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeDestroy(
-    _env: JNIEnv,
+    mut env: EnvUnowned,
     _class: JClass,
     core_ptr: jlong,
 ) {
-    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return };
+    env.with_env(|_env| {
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return Ok::<(), jni::errors::Error>(()) };
 
-    log::info!("[JNI] 销毁 NativeMqttCore，ptr={:#x}", core_ptr);
+        log::info!("[JNI] 销毁 NativeMqttCore，ptr={:#x}", core_ptr);
 
-    // 第一步：优雅关闭
-    // 这会停止后台事件循环，等待最多 3 秒让任务完成清理
-    core.shutdown();
+        core.shutdown();
 
-    // 第二步：释放堆内存
-    //
-    // `Box::from_raw(ptr)` — 把原始指针重新转换为 Box
-    //                        这告诉 Rust"这块内存由你管理了"
-    // `drop(boxed)` — 显式释放 Box，触发 Drop trait
-    //                 即使不写 drop，boxed 离开作用域时也会自动释放
-    //
-    // 注意：调用 Box::from_raw 后，core_ptr 指向的内存已经被释放，
-    // Kotlin 端必须把 nativePtr 设为 0，防止再次使用已释放的指针。
-    let boxed = unsafe { Box::from_raw(core_ptr as *mut NativeMqttCore) };
-    drop(boxed);
+        let boxed = unsafe { Box::from_raw(core_ptr as *mut NativeMqttCore) };
+        drop(boxed);
 
-    log::info!("[JNI] NativeMqttCore 已销毁");
+        log::info!("[JNI] NativeMqttCore 已销毁");
+        Ok(())
+    }).resolve::<jni::errors::LogErrorAndDefault>()
 }
