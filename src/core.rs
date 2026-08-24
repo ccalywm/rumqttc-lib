@@ -380,8 +380,9 @@ impl NativeMqttCore {
         // 避免了每次 publish 都 spawn 新 task 的开销。
         let publish_client_arc = client_arc.clone();
         let publish_callbacks = callbacks.clone();
+        let publish_is_connected = is_connected.clone();
         self.runtime.spawn(async move {
-            Self::publish_sender(publish_rx, publish_client_arc, publish_callbacks).await;
+            Self::publish_sender(publish_rx, publish_client_arc, publish_callbacks, publish_is_connected).await;
         });
 
         // 启动事件循环
@@ -419,10 +420,23 @@ impl NativeMqttCore {
         mut publish_rx: mpsc::Receiver<PublishRequest>,
         client_arc: Arc<Mutex<Option<AsyncClient>>>,
         callbacks: Arc<CallbackManager>,
+        is_connected: Arc<AtomicBool>,
     ) {
         log::info!("[MQTT] publish_sender 任务启动");
 
         while let Some(req) = publish_rx.recv().await {
+            // 快速检查连接状态（原子读，纳秒级开销）
+            // 断线时 rumqttc 的 AsyncClient::publish() 仍会返回 Ok（消息只是入内部队列），
+            // 但 QoS 0 的消息在断线后会被直接丢弃，不会在重连后重发。
+            // 这里提前拦截并通知上层，避免消息"假成功"。
+            if !is_connected.load(Ordering::Relaxed) {
+                let payload_str = String::from_utf8_lossy(&req.payload);
+                let msg = format!("未连接，消息丢弃: {}", payload_str);
+                log::warn!("[MQTT] {}", msg);
+                callbacks.on_error(ERR_PUBLISH_FAILED, &msg);
+                continue;
+            }
+
             // 从 Mutex 中取出 client（加锁 → clone → 释放锁）
             let client = {
                 let guard = client_arc.lock().unwrap();
@@ -442,7 +456,8 @@ impl NativeMqttCore {
                     }
                 }
             } else {
-                let msg = format!("client 不存在，丢弃消息: {}", req.topic);
+                let payload_str = String::from_utf8_lossy(&req.payload);
+                let msg = format!("client 不存在，丢弃消息: {}", payload_str);
                 log::warn!("[MQTT] {}", msg);
                 callbacks.on_error(ERR_PUBLISH_FAILED, &msg);
             }
