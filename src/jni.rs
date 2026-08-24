@@ -49,9 +49,9 @@
 //! ptr = 0                     内存被释放，触发 Drop
 //! ```
 
+use jni::EnvUnowned;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jlong};
-use jni::EnvUnowned;
 use std::sync::Arc;
 
 use crate::callbacks::{CallbackManager, ERR_INVALID_PARAMS};
@@ -243,10 +243,7 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeCreate(
         log::LevelFilter::Off
     };
 
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(level),
-    );
+    android_logger::init_once(android_logger::Config::default().with_max_level(level));
 
     log::info!("[JNI] nativeCreate (debug={})", debug);
 
@@ -346,15 +343,12 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeConnect(
         // 第四步：解析配置参数
         let mut config = MqttConfig::default();
 
-        let host_str = safe_get_string(env, &host);
-        config.host = if host_str.starts_with("tcp://") {
-            host_str[6..].to_string()
-        } else if host_str.starts_with("ssl://") {
-            host_str[6..].to_string()
-        } else {
-            host_str
+        let mut host_str = safe_get_string(env, &host);
+        if host_str.starts_with("tcp://") || host_str.starts_with("ssl://") {
+            host_str.drain(..6);
         };
 
+        config.host = host_str;
         config.port = port as u16;
         config.client_id = safe_get_string(env, &client_id);
         config.username = safe_get_string(env, &username);
@@ -448,7 +442,9 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativePublish(
     qos: jni::sys::jint,
 ) {
     env.with_env(|env| {
-        let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return Ok::<(), jni::errors::Error>(()) };
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else {
+            return Ok::<(), jni::errors::Error>(());
+        };
 
         let topic_str = safe_get_string(env, &topic);
         let payload_vec = safe_get_byte_array(env, &payload);
@@ -465,11 +461,17 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativePublish(
             _ => rumqttc::QoS::AtMostOnce,
         };
 
-        log::info!("[JNI] 发布: topic={}, size={}, qos={}", topic_str, payload_vec.len(), qos);
+        log::info!(
+            "[JNI] 发布: topic={}, size={}, qos={}",
+            topic_str,
+            payload_vec.len(),
+            qos
+        );
 
         core.publish(topic_str, payload_vec, qos_val);
         Ok(())
-    }).resolve::<jni::errors::LogErrorAndDefault>()
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Kotlin 调用：`nativeIsConnected(ptr): Boolean`
@@ -495,7 +497,9 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeIsConnected(
     _class: JClass,
     core_ptr: jlong,
 ) -> jboolean {
-    let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return false };
+    let Some(core) = (unsafe { try_get_core(core_ptr) }) else {
+        return false;
+    };
     core.is_connected()
 }
 
@@ -526,7 +530,9 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeDestroy(
     core_ptr: jlong,
 ) {
     env.with_env(|_env| {
-        let Some(core) = (unsafe { try_get_core(core_ptr) }) else { return Ok::<(), jni::errors::Error>(()) };
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else {
+            return Ok::<(), jni::errors::Error>(());
+        };
 
         log::info!("[JNI] 销毁 NativeMqttCore，ptr={:#x}", core_ptr);
 
@@ -537,5 +543,6 @@ pub unsafe extern "C" fn Java_com_rust_rumqttc_RumqttcClient_nativeDestroy(
 
         log::info!("[JNI] NativeMqttCore 已销毁");
         Ok(())
-    }).resolve::<jni::errors::LogErrorAndDefault>()
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
