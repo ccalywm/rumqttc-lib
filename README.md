@@ -94,11 +94,11 @@
 ```text
 Rust 后台线程                    JVM (Kotlin)
 ─────────────                    ──────────
-1. attach_current_thread()  →    注册线程到 JVM
-2. 获取 GlobalRef            →    防止 Kotlin 对象被 GC
-3. new_string(topic)        →    创建 Java String 对象
-4. call_method("onMsg")     →    调用 Kotlin 方法
-5. exception_clear()         →    清除可能的 Java 异常
+1. java_vm.attach_current_thread(|env| ...)  →    注册线程到 JVM（闭包模式）
+2. 获取 Global<JObject<'static>>              →    防止 Kotlin 对象被 GC
+3. env.new_string(topic)        →    创建 Java String 对象
+4. env.call_method(cb, jni_str!("onMsg"), ...) →    调用 Kotlin 方法（宏签名）
+5. ? 错误传播 + resolve 统一处理               →    自动处理 JNI 异常
 ```
 
 **回调方法：**
@@ -331,10 +331,10 @@ callback_dispatcher
     ▼ callbacks.on_msg(topic, payload)
 CallbackManager:
     │
-    ├─ attach_current_thread()  // 注册线程到 JVM
-    ├─ new_string(topic)         // 创建 Java String
-    ├─ new_string(payload)       // 创建 Java String
-    └─ call_method("onMsg", ...) // 调用 Kotlin 方法
+    ├─ java_vm.attach_current_thread(|env| ...)  // 闭包模式注册线程到 JVM
+    ├─ env.new_string(topic)         // 创建 Java String
+    ├─ env.new_string(payload)       // 创建 Java String
+    └─ env.call_method(cb, jni_str!("onMsg"), jni_sig!(...), ...) // 宏签名调用
     │
     ▼
 Kotlin: callback.onMsg(topic, payload)

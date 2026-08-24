@@ -21,9 +21,9 @@
 | Rust | 2024 edition | 语言版本 |
 | rumqttc | 0.25.1 | MQTT 客户端核心 |
 | tokio | 1.x | 异步运行时（2 worker 线程） |
-| jni | 0.21 | JNI 绑定（注意：0.22 有 Windows 交叉编译问题） |
+| jni | 0.22 | JNI 绑定（0.22 适配完成，使用 EnvUnowned 闭包模式） |
 | rustls | 0.23 + ring | TLS 加密后端（当前未启用 TLS 连接） |
-| android_logger | 0.14 | Android Logcat 日志桥接 |
+| android_logger | 0.15 | Android Logcat 日志桥接 |
 | tokio-util | 0.7 | CancellationToken（优雅取消） |
 
 ---
@@ -227,46 +227,36 @@ async fn event_loop(
 
 ```rust
 pub struct CallbackManager {
-    java_vm:    Arc<jni::JavaVM>,       // JVM 引用（跨线程使用）
-    global_ref: Option<GlobalRef>,      // Kotlin callback 对象的全局引用
+    java_vm:    Arc<jni::JavaVM>,                       // JVM 引用（跨线程使用）
+    global_ref: Option<Global<JObject<'static>>>,       // Kotlin callback 对象的全局引用
 }
 ```
 
-**线程附加策略**：
+**线程附加策略（JNI 0.22 闭包模式）**：
 
 ```rust
-fn attach(&self) -> Option<jni::JNIEnv> {
-    match self.java_vm.attach_current_thread_as_daemon() {
-        Ok(env) => Some(env),
-        Err(e) => {
-            log::error!("[Callback] attach 失败: {}", e);
-            None
-        }
+fn attach<F>(&self, f: F)
+where
+    F: FnOnce(&mut Env, &Global<JObject<'static>>) -> jni::errors::Result<()>,
+{
+    let Some(global_ref) = self.global_ref.as_ref() else { return };
+    let result: Result<(), jni::errors::Error> =
+        self.java_vm.attach_current_thread(|env| f(env, global_ref));
+    if let Err(e) = result {
+        error!("[Callback] 无法附加线程到 JVM: {}", e);
     }
 }
 ```
 
-**为什么用 `attach_current_thread_as_daemon` 而不是 `attach_current_thread`？**
+**为什么用 `attach_current_thread` + 闭包模式？**
 
-- `attach_current_thread()` 返回 `AttachGuard`，guard 被 drop 时自动 detach
-- 每次回调都 attach → callback → guard drop → detach → 下次又 attach
-- 导致 JVM 端不断创建新的 Java Thread 对象（Thread-1043, 1044, 1045...），线程 ID 持续增长
-- `attach_current_thread_as_daemon()` 线程一旦附加就保持附加状态，同一个 OS 线程只附加一次
+- JNI 0.22 统一使用 `attach_current_thread()` 配合闭包，内部自动管理线程生命周期
+- 闭包内同时提供 `env` 和 `global_ref`，无需额外查找
+- 闭包返回 `Result`，支持 `?` 错误传播，简化异常处理
 
-**异常清除的重要性**：
+**异常清除（自动处理）**：
 
-```rust
-match env.call_method(cb, "onMsg", "(Ljava/lang/String;Ljava/lang/String;)V", &[...]) {
-    Ok(_) => {}
-    Err(e) => {
-        log::error!("[Callback] onMsg 调用失败: {}", e);
-        // 关键：必须清除异常！
-        // 如果 Kotlin 端抛出异常，JVM 会在当前线程留下 pending exception
-        // 不清除的话，后续 JNI 调用会触发 ART abort（闪退）
-        env.exception_clear().ok();
-    }
-}
-```
+JNI 0.22 的闭包模式配合 `?` 传播，错误由 `with_env().resolve::<LogErrorAndDefault>()` 统一处理，无需手动调用 `exception_clear()`。
 
 ### 3.4 publish_sender() — 发布消息转发器
 
@@ -317,21 +307,40 @@ async fn publish_sender(
 ### 4.1 指针管理
 
 ```rust
-// 创建实例
-pub unsafe extern "C" fn Java_..._nativeCreate(env: JNIEnv, class: JClass, debug: jboolean) -> jlong {
-    let core = NativeMqttCore::new(debug != 0);
+// 创建实例（JNI 0.22 使用 EnvUnowned 作为入口函数参数）
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_..._nativeCreate(
+    _env: EnvUnowned, _class: JClass, debug: jboolean,
+) -> jlong {
+    let core = match NativeMqttCore::new() {
+        Ok(c) => c,
+        Err(e) => { log::error!("[JNI] 创建失败: {}", e); return 0; }
+    };
     Box::into_raw(Box::new(core)) as jlong  // 分配堆内存，返回指针
 }
 
-// 销毁实例
-pub unsafe extern "C" fn Java_..._nativeDestroy(env: JNIEnv, class: JClass, ptr: jlong) {
-    if ptr == 0 { return; }
-    unsafe {
-        let boxed = Box::from_raw(ptr as *mut NativeMqttCore);  // 重建 Box
-        // boxed 离开作用域时自动 drop，触发 Drop trait
-    }
+// 销毁实例（使用 with_env + resolve 闭包模式）
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_..._nativeDestroy(
+    mut env: EnvUnowned, _class: JClass, ptr: jlong,
+) {
+    env.with_env(|_env| {
+        let Some(core) = (unsafe { try_get_core(ptr) }) else {
+            return Ok::<(), jni::errors::Error>(());
+        };
+        core.shutdown();
+        let boxed = unsafe { Box::from_raw(ptr as *mut NativeMqttCore) };
+        drop(boxed);
+        Ok(())
+    }).resolve::<jni::errors::LogErrorAndDefault>()
 }
 ```
+
+**JNI 0.22 关键变化**：
+- 入口函数参数类型从 `JNIEnv` 改为 `EnvUnowned`
+- 需要调用 `env.with_env(|env| { ... })` 获取可用的 `Env` 引用
+- 错误通过 `.resolve::<LogErrorAndDefault>()` 统一处理
+- `jboolean` 从 `u8` 变为原生 `bool`，无需 `!= 0` 转换
 
 **生命周期**：
 
@@ -347,11 +356,11 @@ ptr = 0                      内存释放，触发 Drop
 ### 4.2 参数转换
 
 ```rust
-// 安全提取 JNI 字符串
-fn safe_get_string(env: &mut JNIEnv, jstr: &JString) -> String {
+// 安全提取 JNI 字符串（JNI 0.22 使用 mutf8_chars 方法）
+fn safe_get_string(env: &mut jni::Env, jstr: &JString) -> String {
     if jstr.is_null() { return String::new(); }
-    match env.get_string(jstr) {
-        Ok(s) => s.into(),
+    match jstr.mutf8_chars(env) {
+        Ok(s) => s.to_string(),
         Err(e) => {
             log::error!("[JNI] get_string 失败: {}", e);
             String::new()
@@ -360,7 +369,7 @@ fn safe_get_string(env: &mut JNIEnv, jstr: &JString) -> String {
 }
 
 // 安全提取 JNI 字节数组
-fn safe_get_byte_array(env: &mut JNIEnv, arr: &JByteArray) -> Vec<u8> {
+fn safe_get_byte_array(env: &mut jni::Env, arr: &JByteArray) -> Vec<u8> {
     if arr.is_null() { return Vec::new(); }
     match env.convert_byte_array(arr) {
         Ok(v) => v,
@@ -370,72 +379,113 @@ fn safe_get_byte_array(env: &mut JNIEnv, arr: &JByteArray) -> Vec<u8> {
         }
     }
 }
+
+// 安全提取 JNI 字符串数组（JNI 0.22 使用泛型和方法式访问）
+fn safe_get_string_array(env: &mut jni::Env, arr: &JObjectArray<JString>) -> Vec<String> {
+    if arr.is_null() { return Vec::new(); }
+    let mut result = Vec::new();
+    if let Ok(len) = arr.len(env) {
+        for i in 0..len {
+            if let Ok(elem) = arr.get_element(env, i as usize) {
+                let s = safe_get_string(env, &elem);
+                if !s.is_empty() { result.push(s); }
+            }
+        }
+    }
+    result
+}
 ```
+
+**JNI 0.22 关键变化**：
+- `env.get_string(jstr)` → `jstr.mutf8_chars(env)`
+- `env.get_array_length(arr)` → `arr.len(env)`
+- `env.get_object_array_element(arr, i)` → `arr.get_element(env, i)`
+- `JObjectArray` → `JObjectArray<JString>`（带泛型参数）
 
 ### 4.3 nativeConnect 完整流程
 
 ```rust
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_..._nativeConnect(
-    env: JNIEnv, class: JClass, ptr: jlong,
-    host: JString, port: jint, client_id: JString,
+    mut env: EnvUnowned, _class: JClass, core_ptr: jlong,
+    host: JString, port: jni::sys::jint, client_id: JString,
     username: JString, password: JString,
-    qos: jint, keep_alive_secs: jint, reconnect_interval_secs: jint,
-    clean_session: jboolean, message_buffer_size: jint,
-    topics: JObjectArray, callback: JObject,
+    qos: jni::sys::jint, keep_alive_secs: jni::sys::jint,
+    reconnect_interval_secs: jni::sys::jint,
+    message_buffer_size: jni::sys::jint,
+    clean_session: jboolean,  // JNI 0.22 中原生 bool
+    connection_timeout_secs: jni::sys::jint,
+    topics_array: JObjectArray<JString>,  // JNI 0.22 带泛型参数
+    callback_obj: JObject,
 ) {
-    // 1. 验证指针
-    let core = match try_get_core(ptr) {
-        Some(c) => c,
-        None => return,
-    };
+    env.with_env(|env| {
+        // 1. 验证指针
+        let Some(core) = (unsafe { try_get_core(core_ptr) }) else {
+            return Ok::<(), jni::errors::Error>(());
+        };
 
-    // 2. 验证 callback 非 null
-    if callback.is_null() {
-        log::error!("[JNI] callback 为 null");
-        return;
-    }
-
-    // 3. 创建 CallbackManager（LocalRef → GlobalRef）
-    let callbacks = match CallbackManager::new(env, callback) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            log::error!("[JNI] 创建 CallbackManager 失败: {}", e);
-            return;
+        // 2. 验证 callback 非 null
+        if callback_obj.is_null() {
+            log::error!("[JNI] callback_obj 为空");
+            return Ok(());
         }
-    };
 
-    // 4. 解析配置
-    let mut config = MqttConfig {
-        host: safe_get_string(&env, &host),
-        port: port as u16,
-        client_id: safe_get_string(&env, &client_id),
-        username: safe_get_string(&env, &username),
-        password: safe_get_string(&env, &password),
-        qos: match qos {
+        // 3. 创建 CallbackManager（LocalRef → GlobalRef）
+        let callbacks = match CallbackManager::new(env, callback_obj) {
+            Ok(cb) => Arc::new(cb),
+            Err(e) => {
+                log::error!("[JNI] 创建 CallbackManager 失败: {}", e);
+                return Ok(());
+            }
+        };
+
+        // 4. 解析配置
+        let mut config = MqttConfig::default();
+        let host_str = safe_get_string(env, &host);
+        config.host = if host_str.starts_with("tcp://") || host_str.starts_with("ssl://") {
+            host_str[6..].to_string()
+        } else {
+            host_str
+        };
+        config.port = port as u16;
+        config.client_id = safe_get_string(env, &client_id);
+        config.username = safe_get_string(env, &username);
+        config.password = safe_get_string(env, &password);
+        config.qos = match qos {
             0 => QoS::AtMostOnce,
             1 => QoS::AtLeastOnce,
             2 => QoS::ExactlyOnce,
             _ => QoS::AtMostOnce,
-        },
-        keep_alive_secs: keep_alive_secs as u64,
-        reconnect_interval_secs: reconnect_interval_secs as u64,
-        clean_session: clean_session != 0,
-        message_buffer_size: message_buffer_size as usize,
-        topics: safe_get_string_array(&env, &topics),
-    };
+        };
+        config.keep_alive_secs = if keep_alive_secs > 0 { keep_alive_secs as u64 } else { 10 };
+        config.reconnect_interval_secs = if reconnect_interval_secs > 0 { reconnect_interval_secs as u64 } else { 10 };
+        config.message_buffer_size = if message_buffer_size > 0 { message_buffer_size as usize } else { 10000 };
+        config.clean_session = clean_session;  // jboolean 现在是原生 bool
+        config.connection_timeout_secs = if connection_timeout_secs > 0 { connection_timeout_secs as u64 } else { 5 };
+        config.topics = safe_get_string_array(env, &topics_array);
 
-    // 5. 参数校验
-    if config.host.is_empty() || config.client_id.is_empty() {
-        log::error!("[JNI] host 或 client_id 为空");
-        callbacks.on_error(ERR_INVALID_PARAMS, "host 或 client_id 不能为空");
-        return;
-    }
+        // 5. 参数校验
+        if config.host.is_empty() || config.client_id.is_empty() {
+            let msg = format!("host 或 clientId 为空 (host='{}', clientId='{}')", config.host, config.client_id);
+            log::error!("[JNI] {}", msg);
+            callbacks.on_error(ERR_INVALID_PARAMS, &msg);
+            return Ok(());
+        }
 
-    // 6. 设置回调并启动连接
-    core.set_callbacks(callbacks);
-    core.connect(config);
+        // 6. 设置回调并启动连接
+        core.set_callbacks(callbacks);
+        core.connect(config);
+        Ok(())
+    }).resolve::<jni::errors::LogErrorAndDefault>()
 }
 ```
+
+**JNI 0.22 关键变化**：
+- 函数签名使用 `EnvUnowned` 而非 `JNIEnv`
+- 整个函数体包裹在 `env.with_env(|env| { ... }).resolve::<LogErrorAndDefault>()` 中
+- `clean_session` 直接使用（jboolean 现在是原生 bool，无需 `!= 0` 转换）
+- 新增 `connection_timeout_secs` 参数
+- `JObjectArray` 改为 `JObjectArray<JString>`（带泛型参数）
 
 ---
 
@@ -513,15 +563,7 @@ pub fn shutdown(&mut self) {
 1. 将 `publish_tx` 容量改为从 config 读取（或硬编码为 1000）
 2. 或者改用 `runtime.block_on(tx.send(...))` 实现背压（但会阻塞 JNI 调用线程）
 
-### 6.3 clean_session 不可从 JNI 配置
-
-**问题**：`MqttConfig` 中有 `clean_session` 字段，但 `nativeConnect` 中没有从 JNI 参数读取它，始终使用默认值 `true`。
-
-**影响**：如果需要持久会话（`clean_session = false`），当前无法实现。
-
-**建议修复**：在 `nativeConnect` 的参数列表中添加 `clean_session: jboolean`，并传入 `MqttConfig`。
-
-### 6.4 不支持 TLS/SSL 连接
+### 6.3 不支持 TLS/SSL 连接
 
 **问题**：虽然 `rumqttc` 依赖配置了 `rustls + ring`，但代码中没有配置 TLS 选项，实际连接仍然是明文。
 
@@ -532,7 +574,7 @@ pub fn shutdown(&mut self) {
 2. 在 `event_loop` 中根据 `use_tls` 配置 `MqttOptions::set_transport(Transport::tls_with_config(...))`
 3. 可能需要处理证书验证（自签名证书 vs 系统 CA）
 
-### 6.5 重连无退避策略
+### 6.4 重连无退避策略
 
 **问题**：重连间隔固定为 `reconnect_interval_secs` 秒，没有指数退避（exponential backoff）。
 
@@ -553,7 +595,7 @@ loop {
 }
 ```
 
-### 6.6 日志级别控制粒度不足
+### 6.5 日志级别控制粒度不足
 
 **问题**：`nativeCreate` 的 `debug` 参数只区分 Info 和 Off 两级。
 
@@ -617,7 +659,23 @@ loop {
 | 2 | `ERR_INIT_FAILED` | 初始化失败（创建 NativeMqttCore 失败） |
 | 3 | `ERR_PUBLISH_FAILED` | 发布失败（网络错误、未连接等） |
 
-**异常清除**：所有 JNI 回调调用后，如果失败必须调用 `env.exception_clear()`，防止 ART abort。
+**异常处理**：JNI 0.22 采用闭包 + `?` 传播错误，由 `with_env().resolve::<LogErrorAndDefault>()` 统一处理异常。回调方法内部只需使用 `?` 返回错误，无需手动调用 `env.exception_clear()`。
+
+```rust
+pub fn on_msg(&self, topic: &str, message: &str) {
+    self.attach(|env, cb| {
+        let topic_jstr = env.new_string(topic)?;
+        let msg_jstr = env.new_string(message)?;
+        env.call_method(
+            cb,
+            jni::jni_str!("onMsg"),
+            jni::jni_sig!((java.lang.String, java.lang.String) -> void),
+            &[jni::JValue::Object(&topic_jstr), jni::JValue::Object(&msg_jstr)],
+        )?;
+        Ok(())
+    });
+}
+```
 
 ### 7.3 锁的使用规范
 
@@ -672,22 +730,25 @@ cargo clean && \
 
 ### 8.2 交叉编译配置
 
-`.cargo/config.toml`：
+`.cargo/config.toml`（macOS 示例）：
 
 ```toml
 [target.aarch64-linux-android]
-linker = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android21-clang.cmd"
-rustflags = ["-C", "link-args=-fuse-ld=lld"]
+linker = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang"
 
 [target.armv7-linux-androideabi]
-linker = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/armv7a-linux-androideabi21-clang.cmd"
-rustflags = ["-C", "link-args=-fuse-ld=lld"]
+linker = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi21-clang"
 
 [env]
-CC_aarch64_linux_android = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android21-clang.cmd"
-CC_armv7_linux_androideabi = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/armv7a-linux-androideabi21-clang.cmd"
-AR_aarch64_linux_android = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-AR_armv7_linux_androideabi = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+CC_aarch64-linux-android = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang"
+AR_aarch64-linux-android = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+CC_armv7-linux-androideabi = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi21-clang"
+AR_armv7-linux-androideabi = "/Users/itc/Library/Android/sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+```
+
+**注意：** 路径需要根据你的 NDK 安装位置调整。Windows 路径示例：
+```toml
+linker = "C:/app/asSdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android21-clang.cmd"
 ```
 
 ### 8.3 调试技巧
@@ -912,82 +973,96 @@ async fn event_loop(config, callbacks, client_arc, cancel_token, is_connected, m
 ### 11.2 完整的 CallbackManager 实现
 
 ```rust
+use jni::objects::{Global, JObject};
+use jni::Env;
+use jni::sys::jboolean;
+use std::sync::Arc;
+
 pub struct CallbackManager {
     java_vm: Arc<jni::JavaVM>,
-    global_ref: Option<GlobalRef>,
+    global_ref: Option<Global<JObject<'static>>>,
 }
 
 impl CallbackManager {
-    pub fn new(env: JNIEnv, callback: JObject) -> Result<Self, jni::errors::Error> {
+    pub fn new(env: &mut Env, callback_obj: JObject) -> jni::errors::Result<Self> {
         let java_vm = env.get_java_vm()?;
-        let global_ref = env.new_global_ref(callback)?;
+        let global_ref = env.new_global_ref(callback_obj)?;
         Ok(Self {
             java_vm: Arc::new(java_vm),
             global_ref: Some(global_ref),
         })
     }
 
-    fn attach(&self) -> Option<jni::JNIEnv> {
-        match self.java_vm.attach_current_thread_as_daemon() {
-            Ok(env) => Some(env),
-            Err(e) => {
-                log::error!("[Callback] attach 失败: {}", e);
-                None
-            }
+    fn attach<F>(&self, f: F)
+    where
+        F: FnOnce(&mut Env, &Global<JObject<'static>>) -> jni::errors::Result<()>,
+    {
+        let Some(global_ref) = self.global_ref.as_ref() else { return };
+        let result: Result<(), jni::errors::Error> =
+            self.java_vm.attach_current_thread(|env| f(env, global_ref));
+        if let Err(e) = result {
+            log::error!("[Callback] 无法附加线程到 JVM: {}", e);
         }
     }
 
     pub fn connect_complete(&self, reconnect: bool, server_uri: &str) {
-        let env = match self.attach() {
-            Some(e) => e,
-            None => return,
-        };
-        let cb = match self.global_ref.as_ref() {
-            Some(r) => r,
-            None => {
-                log::error!("[Callback] global_ref 为空");
-                return;
-            }
-        };
-
-        let reconnect_jval = if reconnect { 1 } else { 0 };
-        let server_uri_jstr = match env.new_string(server_uri) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("[Callback] new_string 失败: {}", e);
-                return;
-            }
-        };
-
-        match env.call_method(
-            cb,
-            "connectComplete",
-            "(ZLjava/lang/String;)V",
-            &[JValue::Int(reconnect_jval), JValue::Object(&server_uri_jstr)],
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("[Callback] connectComplete 调用失败: {}", e);
-                env.exception_clear().ok();
-            }
-        }
+        self.attach(|env, cb| {
+            let uri_jstr = env.new_string(server_uri)?;
+            let reconnect_val: jboolean = reconnect;
+            env.call_method(
+                cb,
+                jni::jni_str!("connectComplete"),
+                jni::jni_sig!((boolean, java.lang.String) -> void),
+                &[jni::JValue::Bool(reconnect_val), jni::JValue::Object(&uri_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn connection_lost(&self, cause: &str) {
-        // ... 类似实现 ...
+        self.attach(|env, cb| {
+            let cause_jstr = env.new_string(cause)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("connectionLost"),
+                jni::jni_sig!((java.lang.String) -> void),
+                &[jni::JValue::Object(&cause_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn on_msg(&self, topic: &str, message: &str) {
-        // ... 类似实现 ...
+        self.attach(|env, cb| {
+            let topic_jstr = env.new_string(topic)?;
+            let msg_jstr = env.new_string(message)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("onMsg"),
+                jni::jni_sig!((java.lang.String, java.lang.String) -> void),
+                &[jni::JValue::Object(&topic_jstr), jni::JValue::Object(&msg_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn on_error(&self, code: i32, message: &str) {
-        // ... 类似实现 ...
+        self.attach(|env, cb| {
+            let msg_jstr = env.new_string(message)?;
+            env.call_method(
+                cb,
+                jni::jni_str!("onError"),
+                jni::jni_sig!((int, java.lang.String) -> void),
+                &[jni::JValue::Int(code), jni::JValue::Object(&msg_jstr)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn release(&mut self) {
         if let Some(global_ref) = self.global_ref.take() {
-            drop(global_ref); // 触发 delete_global_ref
+            drop(global_ref);
+            log::info!("[Callback] JNI 全局引用已释放");
         }
     }
 }
@@ -1001,6 +1076,6 @@ impl Drop for CallbackManager {
 
 ---
 
-**文档版本**：2026-08-20  
+**文档版本**：2026-08-24  
 **维护者**：ccalywm  
 **上游依赖**：基于 [rumqttc](https://github.com/bytebeamio/rumqttc) crate 实现
