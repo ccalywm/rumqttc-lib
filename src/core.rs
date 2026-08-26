@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::callbacks::{CallbackManager, ERR_PUBLISH_FAILED};
 use crate::config::MqttConfig;
+use crate::MutexExt;
 
 /// MQTT 消息（事件循环 → 回调分发器之间传递的数据）
 ///
@@ -284,7 +285,7 @@ impl NativeMqttCore {
     /// 因为 connect 启动的后台事件循环需要回调来通知 Kotlin 端，
     /// 如果回调还没设置就启动事件循环，收到消息也无法通知上层。
     pub fn set_callbacks(&self, callbacks: Arc<CallbackManager>) {
-        let mut guard = self.callbacks.lock().unwrap();
+        let mut guard = self.callbacks.lock_unpoisoned();
         *guard = Some(callbacks);
         // guard 在这里被自动释放（离开作用域时 drop）
     }
@@ -299,7 +300,7 @@ impl NativeMqttCore {
     /// - `Some(Arc<CallbackManager>)` — 回调管理器已设置
     /// - `None` — 还没调用 `set_callbacks()`
     fn get_callbacks(&self) -> Option<Arc<CallbackManager>> {
-        let guard = self.callbacks.lock().unwrap();
+        let guard = self.callbacks.lock_unpoisoned();
         // `.clone()` 这里克隆的是 Arc（智能指针），不是 CallbackManager 本身
         // Arc::clone() 只是增加引用计数，成本是 O(1) 的
         guard.clone()
@@ -345,7 +346,7 @@ impl NativeMqttCore {
 
         // 把 sender 存入结构体，供 publish() 等方法使用
         {
-            let mut guard = self.msg_tx.lock().unwrap();
+            let mut guard = self.msg_tx.lock_unpoisoned();
             *guard = Some(msg_tx.clone());
         }
 
@@ -370,7 +371,7 @@ impl NativeMqttCore {
 
         // 把 sender 存入结构体，供 publish() 使用
         {
-            let mut guard = self.publish_tx.lock().unwrap();
+            let mut guard = self.publish_tx.lock_unpoisoned();
             *guard = Some(publish_tx.clone());
         }
 
@@ -439,7 +440,7 @@ impl NativeMqttCore {
 
             // 从 Mutex 中取出 client（加锁 → clone → 释放锁）
             let client = {
-                let guard = client_arc.lock().unwrap();
+                let guard = client_arc.lock_unpoisoned();
                 guard.clone()
             };
 
@@ -563,7 +564,7 @@ impl NativeMqttCore {
         {
             // 花括号 {} 限定了 MutexGuard 的作用域
             // guard 离开花括号后自动释放锁
-            let mut guard = client_arc.lock().unwrap();
+            let mut guard = client_arc.lock_unpoisoned();
             *guard = Some(client.clone());
             // 锁在这里被释放（guard 被 drop）
         }
@@ -597,7 +598,7 @@ impl NativeMqttCore {
                 _ = cancel_token.cancelled() => {
                     log::info!("[MQTT] 收到取消信号");
                     // 清理客户端句柄
-                    let mut guard = client_arc.lock().unwrap();
+                    let mut guard = client_arc.lock_unpoisoned();
                     *guard = None;
                     return; // 直接退出整个函数
                 }
@@ -807,7 +808,7 @@ impl NativeMqttCore {
         // 注意：tx.send() 是 async 方法，不能在非 async 上下文调用。
         // 这里用 tx.try_send()（同步方法），队列满时立即返回错误而不是等待。
         // 对于 publish 这种高频操作，try_send 足够快（channel 容量 1000，正常不会满）。
-        let guard = self.publish_tx.lock().unwrap();
+        let guard = self.publish_tx.lock_unpoisoned();
         if let Some(ref tx) = *guard {
             if let Err(e) = tx.try_send(PublishRequest { topic, payload, qos }) {
                 log::error!("[MQTT] 发送发布请求到队列失败: {}", e);
@@ -874,7 +875,7 @@ impl NativeMqttCore {
 
         // 第三步：清理客户端句柄
         {
-            let mut guard = self.client.lock().unwrap();
+            let mut guard = self.client.lock_unpoisoned();
             *guard = None;
         }
 

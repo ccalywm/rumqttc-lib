@@ -38,6 +38,32 @@
 //!   onError()           发生错误时调用
 //! ```
 
+use std::sync::{Mutex, MutexGuard};
+
+/// Mutex 扩展：从 poison 状态中恢复
+///
+/// 当持有锁的线程 panic 时，标准库会 poison 这个 mutex。
+/// 后续的 lock() 调用会返回 Err(PoisonError)。
+/// 对于 JNI 库来说，panic 是灾难性的（会导致应用崩溃），
+/// 所以我们选择从 poison 中恢复——即使数据可能不一致，
+/// 也比整个进程崩溃要好。
+///
+/// 在本项目中，所有 Mutex 保护的数据都是简单的整体替换操作，
+/// 不存在多步依赖，因此从 poison 中恢复是安全的。
+pub(crate) trait MutexExt<T> {
+    /// 获取锁，如果 mutex 被 poison 则记录警告并恢复
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| {
+            log::warn!("[MQTT] Mutex 已被 poison，正在恢复");
+            poisoned.into_inner()
+        })
+    }
+}
+
 /// MQTT 连接配置模块
 ///
 /// 定义 [`MqttConfig`] 结构体，存放连接 MQTT 服务器所需的全部参数。
